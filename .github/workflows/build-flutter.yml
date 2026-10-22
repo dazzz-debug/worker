@@ -6,16 +6,27 @@ on:
       jobId:
         description: 'Job ID from Bot'
         required: true
+        type: string
       userId:
         description: 'User ID'
         required: true
+        type: string
       payload:
         description: 'Build Payload (JSON)'
         required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web2apk-${{ github.event.inputs.jobId }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -25,50 +36,90 @@ jobs:
         with:
           distribution: 'zulu'
           java-version: '17'
+          cache: gradle
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.38.0'
           channel: 'stable'
+          cache: true
+
+      - name: Cache Pub packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-flutter-3.38.0-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-flutter-3.38.0-
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-jdk17-${{ hashFiles('**/*.gradle', '**/*.gradle.kts', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-jdk17-
+
+      - name: Read and Validate Payload
+        env:
+          BUILD_PAYLOAD: ${{ github.event.inputs.payload }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$BUILD_PAYLOAD" > payload.json
+          jq -e 'type == "object"' payload.json >/dev/null
+
+          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Payload tidak berisi zipAssetUrl atau url."
+            exit 1
+          fi
+
+          # Support common field names while defaulting to release for backward compatibility.
+          BUILD_TYPE=$(jq -r '
+            (.buildType // .build_type // .mode // .payload.buildType // "release")
+            | tostring | ascii_downcase
+          ' payload.json)
+
+          case "$BUILD_TYPE" in
+            debug|release) ;;
+            *)
+              echo "::error::Build mode tidak valid: $BUILD_TYPE (gunakan debug atau release)."
+              exit 1
+              ;;
+          esac
+
+          echo "ASSET_URL=$ASSET_URL" >> "$GITHUB_ENV"
+          echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+          echo "Build mode selected: $BUILD_TYPE"
 
       - name: Prepare Project
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          echo '${{ github.event.inputs.payload }}' > payload.json
-          cat payload.json
-
-          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
-
-          if [ -z "$ASSET_URL" ]; then
-            echo "::error::Tidak ada zipAssetUrl atau url di payload. Isi payload:"
-            cat payload.json
-            exit 1
-          fi
-
-          echo "Downloading project source from: $ASSET_URL"
-
+          set -euo pipefail
           rm -rf project project.zip
           mkdir -p project
 
+          echo "Downloading project source..."
           if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
-            curl -fL \
+            curl --fail --location --retry 3 --retry-delay 2 \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/octet-stream" \
-              -o project.zip \
-              "$ASSET_URL"
+              -o project.zip "$ASSET_URL"
           else
-            curl -fL -o project.zip "$ASSET_URL"
+            curl --fail --location --retry 3 --retry-delay 2 \
+              -o project.zip "$ASSET_URL"
           fi
 
           unzip -q project.zip -d project
 
-          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
+          PUBSPEC=$(find project -maxdepth 6 -type f -name pubspec.yaml -print -quit)
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
-            find project -maxdepth 3
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP project."
+            find project -maxdepth 3 -type f | head -n 100 || true
             exit 1
           fi
 
@@ -78,26 +129,39 @@ jobs:
 
       - name: Build APK
         run: |
-          set -e
+          set -euo pipefail
           cd "$PROJECT_ROOT"
-          flutter clean
+
+          flutter --version
           flutter pub get
-          flutter build apk --release
+
+          echo "Starting Flutter APK build in $BUILD_TYPE mode..."
+          flutter build apk "--$BUILD_TYPE" --no-pub
 
       - name: Locate APK
         run: |
-          set -e
-          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "app-release.apk" -path "*/flutter-apk/*" | head -n 1)
+          set -euo pipefail
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            APK_NAME="app-debug.apk"
+          else
+            APK_NAME="app-release.apk"
+          fi
+
+          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "$APK_NAME" -path "*/flutter-apk/*" -print -quit)
           if [ -z "$APK_PATH" ]; then
-            echo "::error::app-release.apk tidak ditemukan setelah build."
-            find "$PROJECT_ROOT/build" -maxdepth 5 2>/dev/null || true
+            echo "::error::$APK_NAME tidak ditemukan setelah build mode $BUILD_TYPE."
+            find "$PROJECT_ROOT/build" -maxdepth 6 -type f 2>/dev/null | head -n 100 || true
             exit 1
           fi
+
           echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
-          echo "Found APK at: $APK_PATH"
+          echo "Found APK: $APK_PATH"
+          ls -lh "$APK_PATH"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.jobId }}
           path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          compression-level: 0
