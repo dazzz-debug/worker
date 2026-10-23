@@ -107,6 +107,19 @@ jobs:
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "Project ditemukan: $PROJECT_ROOT"
 
+      # Cache dependency downloads between workflow runs. This avoids fetching
+      # the same Dart packages and Gradle artifacts on every APK build.
+      - name: Cache Flutter and Gradle Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-flutter-3.38.0-gradle-${{ hashFiles('project/**/pubspec.lock', 'project/**/build.gradle', 'project/**/build.gradle.kts', 'project/**/settings.gradle', 'project/**/settings.gradle.kts', 'project/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-3.38.0-gradle-
+
       - name: Install Flutter Dependencies
         shell: bash
         run: |
@@ -156,7 +169,13 @@ jobs:
           cd "$PROJECT_ROOT"
 
           echo "Memulai Flutter build mode: $BUILD_TYPE"
-          flutter build apk "--$BUILD_TYPE" --no-pub
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            # Debug: prioritize iteration speed; keep symbols and skip release shrinking.
+            flutter build apk --debug --no-pub
+          else
+            # Release: tree-shake unused icon fonts to reduce the distributable APK.
+            flutter build apk --release --no-pub --tree-shake-icons
+          fi
 
       - name: Verify APK
         shell: bash
