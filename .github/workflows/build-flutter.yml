@@ -127,38 +127,43 @@ jobs:
           cd "$PROJECT_ROOT"
           flutter pub get
 
-      - name: Install Android NDK
+      # Cache NDK itself: downloading/installing the ~large NDK on every run
+      # can waste several minutes. Restore it before the fallback installer.
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          key: ${{ runner.os }}-android-ndk-27.0.12077973-v1
+
+      - name: Install Android NDK (only if cache miss)
         shell: bash
         run: |
           set -euo pipefail
 
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager -print -quit)"
+          if [ -d "$ANDROID_HOME/ndk/27.0.12077973" ] && [ -f "$ANDROID_HOME/ndk/27.0.12077973/source.properties" ]; then
+            echo "NDK 27.0.12077973 sudah tersedia dari cache; melewati download."
+            exit 0
+          fi
 
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
           if [ -z "$SDKMANAGER" ]; then
             echo "::error::sdkmanager tidak ditemukan"
             exit 1
           fi
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
-
           for attempt in 1 2 3; do
             echo "Instalasi NDK percobaan $attempt dari 3"
-
-            if "$SDKMANAGER" --install "ndk;27.0.12077973"; then
-              break
-            fi
-
+            if "$SDKMANAGER" --install "ndk;27.0.12077973"; then break; fi
             if [ "$attempt" -eq 3 ]; then
               echo "::error::Instalasi NDK gagal setelah 3 percobaan"
               exit 1
             fi
-
             sleep 5
           done
 
-          if [ ! -d "$ANDROID_HOME/ndk/27.0.12077973" ]; then
-            echo "::error::Folder NDK tidak ditemukan setelah instalasi"
+          if [ ! -f "$ANDROID_HOME/ndk/27.0.12077973/source.properties" ]; then
+            echo "::error::NDK tidak lengkap setelah instalasi"
             exit 1
           fi
 
